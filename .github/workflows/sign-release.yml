@@ -1,0 +1,347 @@
+name: Build, Sign and Release NovaTech Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign-release:
+    name: Build, Sign and Release Installer
+    runs-on: windows-latest
+    environment: novatech-installer-signing
+
+    steps:
+
+      # ==========================================================
+      # 1. Validate release tag
+      # ==========================================================
+
+      - name: Validate Release Tag
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $tag = $env:RELEASE_TAG
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+              throw "Release tag cannot be empty."
+          }
+
+          if ($tag -notmatch '^v\d+(\.\d+)*$') {
+              throw "Invalid release tag. Example: v1.0.0.0.1"
+          }
+
+          Write-Host "Release tag: $tag"
+
+      # ==========================================================
+      # 2. Checkout source
+      # ==========================================================
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ==========================================================
+      # 3. Setup .NET 10
+      # ==========================================================
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      # ==========================================================
+      # 4. Restore project
+      # ==========================================================
+
+      - name: Restore
+        shell: pwsh
+        run: |
+          dotnet restore ".\NovaTech\NovaTech.csproj"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Project restore failed."
+          }
+
+      # ==========================================================
+      # 5. Build project
+      # ==========================================================
+
+      - name: Build
+        shell: pwsh
+        run: |
+          dotnet build ".\NovaTech\NovaTech.csproj" `
+            -c Release `
+            --no-restore
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Project build failed."
+          }
+
+      # ==========================================================
+      # 6. Publish single-file Installer.exe
+      # ==========================================================
+
+      - name: Publish Installer
+        shell: pwsh
+        run: |
+          $publishDir = "${{ github.workspace }}\publish"
+
+          dotnet publish `
+              ".\NovaTech\Novatech.csproj" `
+              -c Release `
+              -r win-x64 `
+              --self-contained true `
+              --no-restore `
+              -p:PublishSingleFile=true `
+              -p:IncludeNativeLibrariesForSelfExtract=true `
+              -p:EnableCompressionInSingleFile=true `
+              -p:PublishTrimmed=false `
+              -p:AssemblyName=Installer `
+              -o "$publishDir"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Project publishing failed."
+          }
+
+          $publishedExe = Join-Path $publishDir "Installer.exe"
+
+          if (-not (Test-Path $publishedExe)) {
+              throw "Installer.exe was not produced."
+          }
+
+          $file = Get-Item $publishedExe
+
+          Write-Host "Published installer:"
+          Write-Host $file.FullName
+          Write-Host "Size: $($file.Length) bytes"
+
+          if ($file.Length -lt 100000) {
+              throw "Installer.exe appears unexpectedly small."
+          }
+
+      # ==========================================================
+      # 7. Decode client signing certificate
+      # ==========================================================
+
+      - name: Decode NovaTech Signing Certificate
+        shell: pwsh
+        env:
+          BASE64_PFX: ${{ secrets.NOVATECH_INSTALLER_PFX_BASE64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:BASE64_PFX)) {
+              throw "NOVATECH_INSTALLER_PFX_BASE64 secret is missing."
+          }
+
+          $certificatePath = "${{ github.workspace }}\novatech_signing.pfx"
+
+          try {
+              $bytes = [Convert]::FromBase64String($env:BASE64_PFX)
+
+              [IO.File]::WriteAllBytes(
+                  $certificatePath,
+                  $bytes
+              )
+          }
+          catch {
+              throw "Signing certificate is not valid Base64."
+          }
+
+          if (-not (Test-Path $certificatePath)) {
+              throw "Signing certificate could not be created."
+          }
+
+          Write-Host "Temporary signing certificate created."
+          Write-Host "PFX size: $((Get-Item $certificatePath).Length) bytes"
+
+      # ==========================================================
+      # 8. Locate SignTool
+      # ==========================================================
+
+      - name: Locate SignTool
+        id: signtool
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem `
+              -Path "C:\Program Files (x86)\Windows Kits" `
+              -Filter "signtool.exe" `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Where-Object {
+                  $_.FullName -match "\\x64\\signtool\.exe$"
+              } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+
+          if (-not $signtool) {
+              throw "SignTool.exe could not be found."
+          }
+
+          Write-Host "Using SignTool:"
+          Write-Host $signtool.FullName
+
+          "PATH=$($signtool.FullName)" >> $env:GITHUB_OUTPUT
+
+      # ==========================================================
+      # 9. Sign Installer.exe
+      # ==========================================================
+
+      - name: Sign Installer.exe
+        shell: pwsh
+        env:
+          CERT_PASSWORD: ${{ secrets.NOVATECH_INSTALLER_CERT_PASSWORD }}
+        run: |
+          $signtool = "${{ steps.signtool.outputs.PATH }}"
+
+          $certificate = "${{ github.workspace }}\novatech_signing.pfx"
+
+          $exe = "${{ github.workspace }}\publish\Installer.exe"
+
+          if (-not (Test-Path $certificate)) {
+              throw "Signing certificate does not exist."
+          }
+
+          if (-not (Test-Path $exe)) {
+              throw "Installer.exe does not exist."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:CERT_PASSWORD)) {
+              throw "NOVATECH_INSTALLER_CERT_PASSWORD secret is missing."
+          }
+
+          & $signtool sign `
+              /f "$certificate" `
+              /p "$env:CERT_PASSWORD" `
+              /fd SHA256 `
+              /tr "http://timestamp.digicert.com" `
+              /td SHA256 `
+              /d "NovaTech Installer" `
+              "$exe"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "SignTool failed with exit code $LASTEXITCODE."
+          }
+
+          Write-Host "Installer.exe signed successfully."
+
+      # ==========================================================
+      # 10. Verify Authenticode signature
+      # ==========================================================
+
+      - name: Verify Digital Signature
+        shell: pwsh
+        env:
+          EXPECTED_THUMBPRINT: ${{ secrets.NOVATECH_INSTALLER_CERT_THUMBPRINT }}
+        run: |
+          $exe = "${{ github.workspace }}\publish\Installer.exe"
+
+          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_THUMBPRINT)) {
+              throw "NOVATECH_INSTALLER_CERT_THUMBPRINT secret is missing."
+          }
+
+          $signature = Get-AuthenticodeSignature $exe
+
+          Write-Host "Signature Status:"
+          Write-Host $signature.Status
+
+          if (-not $signature.SignerCertificate) {
+              throw "No signing certificate was found."
+          }
+
+          $actual = $signature.SignerCertificate.Thumbprint.Replace(" ", "").ToUpperInvariant()
+
+          $expected = $env:EXPECTED_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
+
+          Write-Host "Signer:"
+          Write-Host $signature.SignerCertificate.Subject
+
+          Write-Host "Thumbprint:"
+          Write-Host $actual
+
+          Write-Host "Certificate expires:"
+          Write-Host $signature.SignerCertificate.NotAfter
+
+          if ($actual -ne $expected) {
+              throw "Signing certificate thumbprint does not match the expected client certificate."
+          }
+
+          if ($signature.Status -ne "Valid") {
+              throw "Authenticode verification failed: $($signature.Status)"
+          }
+
+          Write-Host "Authenticode signature is valid."
+          Write-Host "Certificate thumbprint verified."
+
+      # ==========================================================
+      # 11. Create GitHub Release
+      # ==============================================================
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $tag = $env:RELEASE_TAG
+
+          gh release create `
+              "$tag" `
+              "${{ github.workspace }}\publish\Installer.exe" `
+              --repo "${{ github.repository }}" `
+              --title "NovaTech Installer $tag" `
+              --generate-notes
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to create release $tag."
+          }
+
+          Write-Host "GitHub release created successfully."
+
+      # ==========================================================
+      # 12. Destroy temporary signing certificate
+      # ==============================================================
+
+      - name: Destroy Temporary Certificate
+        if: always()
+        shell: pwsh
+        run: |
+          $certificate = "${{ github.workspace }}\novatech_signing.pfx"
+
+          if (Test-Path $certificate) {
+              Remove-Item `
+                  "$certificate" `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+              Write-Host "Temporary signing certificate deleted."
+          }
+
+      # ==========================================================
+      # 13. Clean runner files
+      # ==============================================================
+
+      - name: Clean Runner Files
+        if: always()
+        shell: pwsh
+        run: |
+          $files = @(
+              "${{ github.workspace }}\publish\Installer.exe",
+              "${{ github.workspace }}\novatech_signing.pfx"
+          )
+
+          foreach ($file in $files) {
+              if (Test-Path $file) {
+                  Remove-Item `
+                      "$file" `
+                      -Force `
+                      -ErrorAction SilentlyContinue
+              }
+          }
+
+          Write-Host "Temporary runner files cleaned."
